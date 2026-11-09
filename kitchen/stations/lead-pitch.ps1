@@ -9,6 +9,7 @@
 # leads.json unreadable.
 param([string]$Leads = '', [string]$IncomeDir = '', [int]$Max = 8, [string]$Model = 'qwen2.5:7b', [string]$OllamaUrl = 'http://127.0.0.1:11434')
 $ErrorActionPreference = 'Stop'
+. (Join-Path (Split-Path -Parent $PSScriptRoot) 'gpu-lease.ps1')   # local loads book the card first
 if (-not $IncomeDir) { $IncomeDir = if ($env:PASS_INCOME_DIR) { $env:PASS_INCOME_DIR } else { (Join-Path ([Environment]::GetFolderPath('UserProfile')) 'gemini-brain\projects\income') } }
 $job = $env:KITCHEN_JOB
 if ($Leads -and $job) { $Leads = $Leads.Replace('{{job}}', [string]$job) }
@@ -73,11 +74,14 @@ foreach ($it in $todo) {
     $pitch = ''
     if ($env:LEAD_PITCH_FAKE) { $pitch = "$env:LEAD_PITCH_FAKE $($it.title)" }
     else {
+        $ou = $OllamaUrl.TrimEnd('/'); $lease = Enter-GpuLease $ou $Model 'yard-lead-pitch' -TtlSec 480   # the card is booked first
         try {
-            $body = @{ model = $Model; prompt = $prompt; stream = $false; options = @{ temperature = 0.5; num_predict = 300 } } | ConvertTo-Json -Depth 4
-            $r = Invoke-RestMethod -Method Post -Uri ($OllamaUrl.TrimEnd('/') + '/api/generate') -Body $body -ContentType 'application/json' -TimeoutSec 180
+            if ($lease.busy) { throw "graphics card and memory booked by other work ($($lease.why))" }
+            $b = @{ model = $Model; prompt = $prompt; stream = $false; options = @{ temperature = 0.5; num_predict = 300 } }
+            Set-LeaseOnBody $b $lease; $body = $b | ConvertTo-Json -Depth 4
+            $r = Invoke-RestMethod -Method Post -Uri ($ou + '/api/generate') -Body $body -ContentType 'application/json' -TimeoutSec 180
             $pitch = [string]$r.response
-        } catch { $down = $true; Write-Output "lead-pitch: local model not answering ($($_.Exception.Message)); pitches wait for the next run" }
+        } catch { $down = $true; Write-Output "lead-pitch: local model not answering ($($_.Exception.Message)); pitches wait for the next run" } finally { Exit-GpuLease $lease $ou $Model }
     }
     $pitch = Clean ($pitch -replace '(?s)<think>.*?</think>', '') 1500
     if ($pitch) { $pitches[(Norm-Link $it.link)] = $pitch }
