@@ -8,6 +8,7 @@ param([switch]$Probe, [string]$Prompt = '', [string]$Model = '', [string]$Effort
 $url = if ($env:KITCHEN_OLLAMA_URL) { $env:KITCHEN_OLLAMA_URL.TrimEnd('/') } else { 'http://127.0.0.1:11434' }
 # private by construction: the address must be this PC (kitchen/loopback.ps1); anything else is refused before any request is made
 . (Join-Path (Split-Path -Parent $PSScriptRoot) 'loopback.ps1')
+. (Join-Path (Split-Path -Parent $PSScriptRoot) 'gpu-lease.ps1')   # the card is booked before a load (kitchen/gpu-lease.ps1)
 $offPc = if ($url -ne 'off' -and -not (Test-LoopbackUrl $url)) { Get-LoopbackRefusal $url } else { '' }
 function KvFlags {   # Ollama's memory savers, read from this process's environment (advisory: the server may differ)
     @{ flash = ($env:OLLAMA_FLASH_ATTENTION -eq '1'); kv = ($env:OLLAMA_KV_CACHE_TYPE -eq 'q8_0') }
@@ -51,7 +52,11 @@ while (-not $got -and (Get-Date) -lt $until) {
     if ($env:KITCHEN_HEARTBEAT) { for ($i = 0; $i -lt 20; $i++) { try { [IO.File]::WriteAllText($env:KITCHEN_HEARTBEAT, "$(Get-Date -Format o) quiet=$($TimeoutSec + 120)"); break } catch [IO.IOException] { Start-Sleep -Milliseconds 50 } } }   # the model call after the queue is bounded by TimeoutSec
 }
 if (-not $got) { $r.limit = $true; $r.restMin = 5; $r.error = 'graphics card busy with another local cook'; return $r }
+$lease = $null
 try {
+    # the card is booked first (whole model, part of it, or the processor); nothing free in time: busy, the order waits
+    $lease = Enter-GpuLease $url $Model "yard-local-$Role" -WaitSec ([math]::Min(300, [math]::Max(0, $TimeoutSec - 600))) -TtlSec ($TimeoutSec + 300)
+    if ($lease.busy) { $r.limit = $true; $r.restMin = 5; $r.error = "graphics card and memory booked by other work ($($lease.why))"; return $r }
     # context sized to the prompt (about 3 characters a token plus room for the answer): 2048, 4096 or 8192 and no more, so the model stays whole on the card
     $need = [int]($Prompt.Length / 3) + 1024
     $ctx = if ($need -le 2048) { 2048 } elseif ($need -le 4096) { 4096 } else { 8192 }
@@ -67,8 +72,10 @@ try {
         } catch { }
     }
     # thinking models think only when planning (it is slow); a model without thinking ignores the switch or is asked again without it
-    $body = @{ model = $Model; stream = $false; keep_alive = '2m'; think = ($Role -eq 'plan'); options = @{ temperature = 0.2; num_ctx = $ctx }
-               messages = @(@{ role = 'system'; content = $system }, @{ role = 'user'; content = $Prompt }) } | ConvertTo-Json -Depth 6
+    $b = @{ model = $Model; stream = $false; keep_alive = '2m'; think = ($Role -eq 'plan'); options = @{ temperature = 0.2; num_ctx = $ctx }
+            messages = @(@{ role = 'system'; content = $system }, @{ role = 'user'; content = $Prompt }) }
+    Set-LeaseOnBody $b $lease   # under a lease: keep_alive 0 (unloaded right after) and the leased layer count
+    $body = $b | ConvertTo-Json -Depth 6
     try { $res = Invoke-RestMethod -Uri "$url/api/chat" -Method Post -Body ([Text.Encoding]::UTF8.GetBytes($body)) -ContentType 'application/json; charset=utf-8' -TimeoutSec ([math]::Max(60, $TimeoutSec - 60)) }
     catch { if ("$_" -notmatch '(?i)think') { throw }; $b2 = $body | ConvertFrom-Json -AsHashtable; $b2.Remove('think'); $res = Invoke-RestMethod -Uri "$url/api/chat" -Method Post -Body ([Text.Encoding]::UTF8.GetBytes(($b2 | ConvertTo-Json -Depth 6))) -ContentType 'application/json; charset=utf-8' -TimeoutSec ([math]::Max(60, $TimeoutSec - 60)) }
     $text = [string]$res.message.content
@@ -80,5 +87,5 @@ try {
     $msg = $_.Exception.Message
     if ($msg -match '(?i)out of memory|unable to allocate|actively refused|No connection could be made') { $r.limit = $true; $r.restMin = 5 }
     $r.error = "local cook: $msg"
-} finally { if ($got) { try { $gpu.ReleaseMutex() } catch { } } }
+} finally { Exit-GpuLease $lease $url $Model; if ($got) { try { $gpu.ReleaseMutex() } catch { } } }
 $r

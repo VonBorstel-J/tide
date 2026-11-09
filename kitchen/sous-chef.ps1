@@ -39,6 +39,7 @@ New-Item -ItemType Directory -Force -Path $root | Out-Null
 $statePath = Join-Path $root 'suppliers-state.json'; $cachePath = Join-Path $root 'sous-cache.json'; $eventsPath = Join-Path $root 'events.jsonl'
 $cooksDir = Join-Path $PSScriptRoot 'cooks'
 $ollama = if ($env:KITCHEN_OLLAMA_URL) { $env:KITCHEN_OLLAMA_URL.TrimEnd('/') } else { 'http://127.0.0.1:11434' }
+. (Join-Path $PSScriptRoot 'gpu-lease.ps1')   # the judges book the card before a load, like the local cook
 
 # ---- settings: built-in defaults, then kitchen.json (repo), then kitchen.json (state folder) ----
 $S = @{
@@ -264,12 +265,15 @@ function Ask-Judge([string]$system, [string]$text, $schema) {
     $snip = $text.Substring(0, [math]::Min(6000, $text.Length))
     $need = [int](($system.Length + $snip.Length) / 3) + 256   # context sized to the prompt: 2048, 4096 or 8192 at most
     $ctx = if ($need -le 2048) { 2048 } elseif ($need -le 4096) { 4096 } else { 8192 }
-    $body = @{ model = [string]$S.sous.judge; stream = $false; think = $false; keep_alive = '1m'; format = $schema; options = @{ temperature = 0; num_predict = 24; num_ctx = $ctx; num_gpu = [int]$S.sous.judgeGpu }   # small context + short stay: little RAM, gone 1 min after use
-               messages = @(@{ role = 'system'; content = $system }, @{ role = 'user'; content = $snip }) } | ConvertTo-Json -Depth 8
+    $lease = Enter-GpuLease $ollama ([string]$S.sous.judge) 'yard-judge' -TtlSec ([int]$S.sous.judgeTimeoutSec + 120) -MaxGpu ([int]$S.sous.judgeGpu)
+    if ($lease.busy) { return $null }   # card and memory booked: no answer, the caller fails closed
+    $b = @{ model = [string]$S.sous.judge; stream = $false; think = $false; keep_alive = '1m'; format = $schema; options = @{ temperature = 0; num_predict = 24; num_ctx = $ctx; num_gpu = [int]$S.sous.judgeGpu }   # small context + short stay: little RAM, gone 1 min after use
+            messages = @(@{ role = 'system'; content = $system }, @{ role = 'user'; content = $snip }) }
+    Set-LeaseOnBody $b $lease; $body = $b | ConvertTo-Json -Depth 8
     try {
         $r = Invoke-RestMethod -Uri "$ollama/api/chat" -Method Post -Body $body -ContentType 'application/json' -TimeoutSec ([int]$S.sous.judgeTimeoutSec)
         return ($r.message.content | ConvertFrom-Json -AsHashtable)
-    } catch { return $null }
+    } catch { return $null } finally { Exit-GpuLease $lease $ollama ([string]$S.sous.judge) }
 }
 # One look at an order by the local judge: is it about Jordan's life (private), and what kind of work is it. Answers are cached.
 # First choice: a decision model (Ollama /v1/systemone) that scores the options and returns probabilities in well under a second;
@@ -281,17 +285,19 @@ function Judge-Order([string]$text) {
     if ($script:judged.ContainsKey($ck)) { return $script:judged[$ck] }   # one look per order per pick (privacy and kind sorting both ask)
     $c = (Read-JsonFile $cachePath)[$ck]; if ($c) { $script:judged[$ck] = $c; return $c }   # the same order at the next step or retry: no 90 s re-judge
     $snip = $text.Substring(0, [math]::Min(6000, $text.Length)); $v = $null
-    if ($S.sous.decider) {
-        $body = @{ model = [string]$S.sous.decider; keep_alive = '15m'; state = @{ order = $snip }; questions = @{
+    $dl = if ($S.sous.decider) { Enter-GpuLease $ollama ([string]$S.sous.decider) 'yard-decider' -TtlSec ([int]$S.sous.judgeTimeoutSec + 120) }   # booked like the judge
+    if ($S.sous.decider -and -not $dl.busy) {
+        $db = @{ model = [string]$S.sous.decider; keep_alive = '15m'; state = @{ order = $snip }; questions = @{
             about = @{ type = 'choice'; instructions = 'What is this order about?'; criteria = @{
                 personal = "The writer's own life or other real people: family, partner, friends, home, rent, job, boss, employer, interview, offer, pay, money, debts, health, feelings, therapy, legal trouble, or named real people"
                 technical = 'Code, software, systems, tools or the kitchen itself'; general = 'Public knowledge with nothing about the writer' } }
-            kind = @{ type = 'choice'; instructions = 'What kind of work is it?'; criteria = @{ code = 'Writing or fixing code'; write = 'Prose: notes, messages, plans, docs, explanations'; quick = 'A short answer, a label or a yes/no'; plan = 'Designing an approach' } } } } | ConvertTo-Json -Depth 8
+            kind = @{ type = 'choice'; instructions = 'What kind of work is it?'; criteria = @{ code = 'Writing or fixing code'; write = 'Prose: notes, messages, plans, docs, explanations'; quick = 'A short answer, a label or a yes/no'; plan = 'Designing an approach' } } } }
+        Set-LeaseOnBody $db $dl; $body = $db | ConvertTo-Json -Depth 8
         try {
             $r = Invoke-RestMethod -Uri "$ollama/v1/systemone" -Method Post -Body ([Text.Encoding]::UTF8.GetBytes($body)) -ContentType 'application/json; charset=utf-8' -TimeoutSec ([int]$S.sous.judgeTimeoutSec)
             $pp = [double]$r.answers.about.probabilities.personal
             if ($null -ne $r.answers.about.choice) { $v = @{ private = ($pp -ge [double]$S.sous.privateAt); p = [math]::Round($pp, 3); kind = [string]$r.answers.kind.choice; by = 'decider' } }
-        } catch { }
+        } catch { } finally { Exit-GpuLease $dl $ollama ([string]$S.sous.decider) }
     }
     # A close call (between privateAt and sureAt) with no personal details the patterns can see gets a second opinion from the
     # chat judge: private only if it also says personal. If the second judge can't answer, it stays private (fail closed).
