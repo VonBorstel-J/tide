@@ -2,18 +2,25 @@
 
 # Tide
 
-Tide is one person's AI workshop on a Windows PC. It has two parts:
+I run coding jobs on a Windows PC and review them from my phone. Tide gives each change its own branch, runs the tests, and lets me see which jobs need a decision. A worker can hang, hit its memory limit, or stop halfway through a change. The supervisor keeps enough state on disk to pick up the queue after a restart.
 
-- **The Yard** (code folder `kitchen/`): a job runner. You give it a work order; AI crews plan, build, test and review the change on its own branch, and it is merged only when the tests pass.
-- **The Board** (code folder `pass-app/`): a small phone app to watch the Yard and to approve or stop its work. It listens only on the PC itself and is reached over Tailscale.
+## Watch a job recover
 
-The rest of this page also covers the scripts that keep the agents' notes (the "brain") healthy.
+On Windows with PowerShell 7, run this from the repository root.
 
-**Status.** This is personal infrastructure, shared as it is so others can read it and its tests can run on GitHub Actions. It is built for one machine: paths default to `%USERPROFILE%`, and private settings (push topic, pass key, job-search settings) live outside the repo, in `%LOCALAPPDATA%\brain-kitchen`. Nothing personal is in the repo. Issues are welcome. Pull requests from outside are read by hand, and CI on them waits for approval.
+```powershell
+pwsh -File kitchen/demo.ps1 -Open
+```
 
-**History.** This repo starts from a cleaned snapshot taken on 2026-10-24. The earlier history stays private. Since 2026-10-26 this repo is Tide's home: its pull requests, CI and merges happen here. How work lands in a public repo (commit and merge identity, where personal settings live, how older private work is ported): "Building in public" in `kitchen/BUILDING.md`.
+The demo starts ten simulated workers in a temporary folder. Watch the one that fails on its first try and the one that keeps failing. Halfway through, the demo restarts the supervisor. The deployment step waits for approval, which the demo supplies. At the end you can inspect the status page and the event log. [Demo script](kitchen/demo.ps1) · [Supervisor tests](tests/Test-KitchenSupervisor.ps1)
 
-**Licence.** MIT (see `LICENSE`). The bundled font, JetBrains Mono, is under the SIL Open Font License (`pass-app/public/OFL.txt`). To report a security problem, see `SECURITY.md`. Not affiliated with any company named in examples.
+In daily use I make that decision from the Board, the phone interface. I can read what a job wants to change, approve it, or stop it. The Board reaches the PC over Tailscale. The Yard is the job runner on the PC. [Phone interface](pass-app/README.md) · [Job runner](kitchen/README.md)
+
+## Running Tide
+
+The Windows setup uses one account. Paths default to `%USERPROFILE%` and private settings live under `%LOCALAPPDATA%\brain-kitchen`. The public repository starts with the October 24, 2026 snapshot. [Build and contribution notes](kitchen/BUILDING.md) · [License](LICENSE) · [Bundled font license](pass-app/public/OFL.txt) · [Report a security issue](SECURITY.md)
+
+The following reference covers the scripts that maintain notes between jobs.
 
 **Run a test suite.** `pwsh -NoProfile -File scripts/run-bounded.ps1 -Script tests/Test-PassApp.ps1 -TimeoutSeconds 1200` (every suite in `tests/` runs the same way).
 
